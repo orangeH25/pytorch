@@ -424,7 +424,8 @@ void initModule(PyObject* module) {
              const py::args& args,
              const py::object& py_threads,
              const py::object& py_group_size,
-             const py::object& arg_casts) {
+             const py::object& arg_casts,
+             const py::object& error_buf_idx) {
             auto threads = optional_vec_from_pyobject(py_threads);
             auto group_size = optional_vec_from_pyobject(py_group_size);
             OptionalArgCaster caster(arg_casts);
@@ -440,6 +441,11 @@ void initModule(PyObject* module) {
                   continue;
                 }
                 caster.setValue(self, idx, args[idx]);
+              }
+              // Set error buffer if error_buf_idx is provided
+              if (!error_buf_idx.is_none()) {
+                auto error_idx = error_buf_idx.cast<unsigned>();
+                self.setErrorBufferIndex(error_idx);
               }
               TORCH_CHECK(
                   threads.has_value() && threads->size() < 4,
@@ -478,7 +484,8 @@ void initModule(PyObject* module) {
           py::kw_only(),
           py::arg("threads") = py::none(),
           py::arg("group_size") = py::none(),
-          py::arg("arg_casts") = py::none())
+          py::arg("arg_casts") = py::none(),
+          py::arg("error_buf_idx") = py::none())
       .def_property_readonly(
           "max_threads_per_threadgroup",
           &MetalKernelFunction::getMaxThreadsPerThreadgroup)
@@ -488,6 +495,26 @@ void initModule(PyObject* module) {
       .def_property_readonly(
           "static_thread_group_memory_length",
           &MetalKernelFunction::getStaticThreadGroupMemoryLength);
+  py::class_<
+      PrecompiledMetalShaderLibrary,
+      std::shared_ptr<PrecompiledMetalShaderLibrary>>(
+      m, "_mps_PrecompiledShaderLibrary")
+      .def(
+          "__getattr__",
+          [](PrecompiledMetalShaderLibrary& self, const std::string& name) {
+            return self.getKernelFunction(name);
+          })
+      .def("__dir__", [](PrecompiledMetalShaderLibrary& self) {
+        return self.getFunctionNames();
+      });
+  m.def("_mps_loadMetalllib", [](const py::bytes& data) {
+    auto sv = static_cast<std::string_view>(data);
+    std::vector<uint8_t> bytes(sv.begin(), sv.end());
+    return std::make_shared<PrecompiledMetalShaderLibrary>(std::move(bytes));
+  });
+  m.def("_mps_loadMetallibFromPath", [](const std::string& path) {
+    return std::make_shared<PrecompiledMetalShaderLibrary>(path);
+  });
   m.def("_mps_compileShader", [](const std::string& source) {
     return std::make_shared<DynamicMetalShaderLibrary>(source);
   });

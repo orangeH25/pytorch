@@ -35,7 +35,7 @@ def check_cpu_supported():
     supported = (
         requires_avx2_on_cpu
         and not torch.xpu.is_available()
-        and not sys.platform == "darwin"
+        and sys.platform != "darwin"
     )
     return supported
 
@@ -68,6 +68,13 @@ def lower_cpu(
         mask_graph,
     ) = block_mask
 
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        raise ValueError(
+            f"Mixed query, key, and value dtype is not supported on this platform, "
+            f"got query.dtype: {query.dtype}, key.dtype: {key.dtype}, "
+            f"and value.dtype: {value.dtype}."
+        )
+
     if kernel_options["OUTPUT_LOGSUMEXP"]:
         raise NotImplementedError(
             "torch.compile on CPU only supports inference and `return_lse` is not supported yet."
@@ -77,7 +84,7 @@ def lower_cpu(
             "torch.compile on current platform is not supported for CPU."
         )
 
-    fake_buffers: list[Buffer] = []  # noqa: F821
+    fake_buffers: list[Buffer] = []
 
     # [Note] Handle the case where the split sizes are not statically known.
     # The value of cur_qSplitSize and cur_kvSplitSize are decided during runtime.
@@ -321,7 +328,7 @@ def lower_cpu(
         key,
         value,
     ]
-    res = autotune_select_algorithm(
+    res, _ = autotune_select_algorithm(
         "flex_attention",
         _choices,
         inputs_for_autotuning,

@@ -9,7 +9,6 @@
 #include <c10/core/impl/TorchDispatchModeTLS.h>
 #include <c10/util/Logging.h>
 #include <c10/util/accumulate.h>
-#include <c10/util/irange.h>
 #include <optional>
 
 #include <utility>
@@ -273,12 +272,23 @@ bool TensorImpl::compute_non_overlapping_and_dense() const {
       sizes_and_strides_.strides_arrayref());
 }
 
+void TensorImpl::incref_pyobject() const noexcept {
+  pyobj_slot_.incref();
+}
+
+void TensorImpl::decref_pyobject() const noexcept {
+  pyobj_slot_.decref();
+}
+
+bool TensorImpl::try_incref_pyobject() const noexcept {
+  return pyobj_slot_.try_incref();
+}
+
 void TensorImpl::release_resources() {
   autograd_meta_.reset();
   if (storage_) {
     storage_ = {};
   }
-  pyobj_slot_.maybe_destroy_pyobj();
 }
 
 #ifndef C10_DISABLE_TENSORIMPL_EXTENSIBILITY
@@ -313,8 +323,15 @@ void TensorImpl::throw_data_ptr_access_error() const {
 c10::SymBool TensorImpl::sym_is_contiguous_custom(
     at::MemoryFormat memory_format) const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomStrides))) {
-    return pyobj_slot_.load_pyobj_interpreter()->is_contiguous(
-        this, memory_format);
+    // TO reduce BC breaking and reduce having to introduce
+    // sym_is_contiguous. call is_contiguous when tensor does not
+    if (C10_UNLIKELY(has_symbolic_sizes_strides_)) {
+      return pyobj_slot_.load_pyobj_interpreter()->sym_is_contiguous(
+          this, memory_format);
+    } else {
+      return pyobj_slot_.load_pyobj_interpreter()->is_contiguous(
+          this, memory_format);
+    }
   }
 
   return sym_is_contiguous_default(memory_format);

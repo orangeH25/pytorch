@@ -453,20 +453,18 @@ static Tensor detach(c10::DispatchKeySet ks, const Tensor& self) {
     return at::_ops::detach::redispatch(
         ks & c10::after_ADInplaceOrView_keyset, self);
   })();
-  // NB: we can't make detach() a normal view operator because the codegen
-  // generates allow_tensor_metadata_change = True for them. In the future we
-  // should have an option for this in the codegen.
-  auto result = as_view(
-      /* base */ self,
-      /* output */ out,
-      /* is_bw_differentiable */ false,
-      /* is_fw_differentiable */ false,
-      /* view_func */ nullptr,
-      /* rev_view_func */ nullptr,
-      /* creation_meta */ CreationMeta::DEFAULT,
-      /*allow_tensor_metadata_change=*/false);
-
-  return result;
+  // NB: we can't make detach() a normal view operator because the
+  // codegen generates allow_tensor_metadata_change = True (and leaves
+  // is_fresh_tensor to the default setting of False) for them. In the
+  // future we should have an option for this in the codegen.
+  if (self.is_inference()) {
+    return out;
+  }
+  return ::torch::autograd::make_variable_non_differentiable_view(
+      self,
+      out,
+      /* allow_tensor_metadata_change */ false,
+      /* is_fresh_tensor */ true);
 }
 
 static Tensor _fw_primal(
@@ -481,11 +479,10 @@ static Tensor _fw_primal(
   std::function<at::Tensor(const at::Tensor&)> rev_func = nullptr;
   if (!self.unsafeGetTensorImpl()->support_as_strided()) {
     func = std::make_unique<ViewViewFunc>(self.sym_sizes());
-    rev_func = [=](const at::Tensor& input_view) {
+    rev_func = [=](const at::Tensor& input_view) -> at::Tensor {
       TORCH_INTERNAL_ASSERT(
           false,
           "Reverse view_func for _fw_primal() is not currently supported");
-      return Tensor();
     };
   }
   auto result = as_view(
@@ -514,11 +511,10 @@ static Tensor _make_dual(
   std::function<at::Tensor(const at::Tensor&)> rev_func = nullptr;
   if (!primal.unsafeGetTensorImpl()->support_as_strided()) {
     func = std::make_unique<ViewViewFunc>(primal.sym_sizes());
-    rev_func = [=](const at::Tensor& input_view) {
+    rev_func = [=](const at::Tensor& input_view) -> at::Tensor {
       TORCH_INTERNAL_ASSERT(
           false,
           "Reverse view_func for _make_dual() is not currently supported");
-      return Tensor();
     };
   }
   auto result = as_view(

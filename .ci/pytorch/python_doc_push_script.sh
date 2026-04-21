@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # This is where the local pytorch install in the docker image is located
-pt_checkout="/var/lib/jenkins/workspace"
+pt_checkout="${GITHUB_WORKSPACE:-/var/lib/jenkins/workspace}"
 
 source "$pt_checkout/.ci/pytorch/common_utils.sh"
 
@@ -50,8 +50,14 @@ echo "install_path: $install_path  version: $version"
 
 build_docs () {
   set +e
-  set -o pipefail
-  make "$1" 2>&1 | tee /tmp/docs_build.txt
+  # Don't pipe through tee: sphinx -j auto forks workers that inherit
+  # the pipe fd and hold it open after sphinx exits, causing tee to
+  # block forever. Write to a file and tail with --pid so it exits
+  # (after draining) when make finishes.
+  make "$1" > /tmp/docs_build.txt 2>&1 &
+  local make_pid=$!
+  tail -f --pid=$make_pid /tmp/docs_build.txt
+  wait $make_pid
   code=$?
   if [ $code -ne 0 ]; then
     set +x
@@ -87,25 +93,46 @@ pushd docs
 if [ "$is_main_doc" = true ]; then
   build_docs html || exit $?
 
-  make coverage
+  # Run coverage check without parallel workers since it's a quick
+  # check that doesn't need parallelism, and avoids re-triggering the
+  # expensive parallel read/write machinery.
+  SPHINXOPTS="-WT --keep-going" make coverage
   # Now we have the coverage report, we need to make sure it is empty.
-  # Count the number of lines in the file and turn that number into a variable
-  # $lines. The `cut -f1 ...` is to only parse the number, not the filename
-  # Skip the report header by subtracting 2: the header will be output even if
-  # there are no undocumented items.
+  # Sphinx 7.2.6+ format: python.txt contains a statistics table with a TOTAL row
+  # showing the undocumented count in the third column.
+  # Example: | TOTAL | 99.83% | 2 |
   #
   # Also: see docs/source/conf.py for "coverage_ignore*" items, which should
   # be documented then removed from there.
-  lines=$(wc -l build/coverage/python.txt 2>/dev/null |cut -f1 -d' ')
-  undocumented=$((lines - 2))
-  if [ $undocumented -lt 0 ]; then
+
+  # Extract undocumented count from TOTAL row in Sphinx 7.2.6 statistics table
+  # The table format is: | Module | Coverage | Undocumented |
+  # Extract the third column (undocumented count) from the TOTAL row
+  undocumented=$(grep "| TOTAL" build/coverage/python.txt | awk -F'|' '{print $4}' | tr -d ' ')
+
+  if [ -z "$undocumented" ] || ! [[ "$undocumented" =~ ^[0-9]+$ ]]; then
     echo coverage output not found
     exit 1
-  elif [ $undocumented -gt 0 ]; then
-    echo undocumented objects found:
-    cat build/coverage/python.txt
+  elif [ "$undocumented" -gt 0 ]; then
+    set +x  # Disable command echoing for cleaner output
+    echo ""
+    echo "====================="
+    echo "UNDOCUMENTED OBJECTS:"
+    echo "====================="
+    echo ""
+    # Find the line number of the TOTAL row and print only what comes after it
+    total_line=$(grep -n "| TOTAL" build/coverage/python.txt | cut -d: -f1)
+    if [ -n "$total_line" ]; then
+      # Print only the detailed list (skip the statistics table)
+      tail -n +$((total_line + 2)) build/coverage/python.txt
+    else
+      # Fallback to showing entire file if TOTAL line not found
+      cat build/coverage/python.txt
+    fi
+    echo ""
     echo "Make sure you've updated relevant .rsts in docs/source!"
-    echo "You can reproduce locally by running 'cd docs && make coverage && cat build/coverage/python.txt'"
+    echo "You can reproduce locally by running 'cd docs && make coverage && tail -n +\$((grep -n \"| TOTAL\" build/coverage/python.txt | cut -d: -f1) + 2)) build/coverage/python.txt'"
+    set -x  # Re-enable command echoing
     exit 1
   fi
 else

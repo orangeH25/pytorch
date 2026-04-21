@@ -1,13 +1,11 @@
 #include <torch/csrc/jit/frontend/function_schema_parser.h>
 #include <torch/csrc/utils/python_dispatch.h>
 
-#include <ATen/ATen.h>
-#include <ATen/FuncTorchTLS.h>
+#include <ATen/DTensorState.h>
 #include <ATen/FunctionalTensorWrapper.h>
 #include <ATen/TensorSubclassLikeUtils.h>
 #include <ATen/autocast_mode.h>
 #include <ATen/core/NestedIntSymNodeImpl.h>
-#include <ATen/core/PythonOpRegistrationTrampoline.h>
 #include <ATen/core/dispatch/Dispatcher.h>
 
 #include <ATen/functorch/BatchedTensorImpl.h>
@@ -15,19 +13,16 @@
 
 #include <c10/core/SafePyObject.h>
 #include <torch/csrc/PyInterpreter.h>
+#include <torch/csrc/autograd/autograd_not_implemented_fallback.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/csrc/utils/tensor_new.h>
 
+#include <c10/util/Synchronized.h>
 #include <c10/util/flat_hash_map.h>
-#include <pybind11/operators.h>
-#include <pybind11/stl.h>
 #include <torch/csrc/inductor/aoti_eager/kernel_holder.h>
-#include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/utils/python_raii.h>
 
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <utility>
 
@@ -36,15 +31,18 @@ namespace py = pybind11;
 namespace torch::impl::dispatch {
 
 // Global storage for leaked Python filenames to ensure they remain valid
-// for the lifetime of Library objects
-static std::vector<std::string> leaked_python_filenames_;
+// for the lifetime of Library objects. We use unique_ptr<string> rather than
+// plain string so that c_str() pointers handed to Library objects remain valid
+// when the vector reallocates.
+static c10::Synchronized<std::vector<std::unique_ptr<std::string>>>
+    leaked_python_filenames_;
 
 // NB: I'd like to index this on OperatorHandle, but I can't, as I can't
 // guarantee that the main interpreter has finish doing all registrations before
 // the other interpreters start banging on it
-static ska::flat_hash_map<
+static c10::Synchronized<ska::flat_hash_map<
     c10::OperatorName,
-    ska::flat_hash_map<c10::DispatchKey, std::shared_ptr<c10::SafePyObject>>>
+    ska::flat_hash_map<c10::DispatchKey, std::shared_ptr<c10::SafePyObject>>>>
     python_registrations_;
 
 static torch::Library::Kind parseKind(const std::string& k) {
@@ -430,10 +428,12 @@ void initDispatchBindings(PyObject* module) {
                           std::make_unique<PythonKernelHolder>(
                               func, dispatch, with_keyset))),
                   register_or_verify());
-              python_registrations_[lib._resolve(name)].insert_or_assign(
-                  dispatch,
-                  std::make_shared<c10::SafePyObject>(
-                      func.release().ptr(), getPyInterpreter()));
+              python_registrations_.withLock([&](auto& regs) {
+                regs[lib._resolve(name)].insert_or_assign(
+                    dispatch,
+                    std::make_shared<c10::SafePyObject>(
+                        func.release().ptr(), getPyInterpreter()));
+              });
             }
             END_HANDLE_TH_ERRORS_PYBIND
           },
@@ -493,7 +493,20 @@ void initDispatchBindings(PyObject* module) {
           "",
           py::arg("dispatch"),
           py::arg("func"),
-          py::arg("with_keyset") = false);
+          py::arg("with_keyset") = false)
+      .def(
+          "register_ad_inplace_or_view_fallback",
+          [](const py::object& self, const char* name) {
+            HANDLE_TH_ERRORS
+            auto& lib = self.cast<torch::Library&>();
+            lib.impl(
+                name,
+                c10::DispatchKey::ADInplaceOrView,
+                torch::autograd::autogradNotImplementedInplaceOrViewFallback());
+            END_HANDLE_TH_ERRORS_PYBIND
+          },
+          "",
+          py::arg("name"));
 
   m.def(
       "_dispatch_library",
@@ -505,8 +518,11 @@ void initDispatchBindings(PyObject* module) {
         HANDLE_TH_ERRORS
         // Store the file string in global storage to ensure it remains valid
         // for the lifetime of the Library object
-        leaked_python_filenames_.emplace_back(file);
-        const char* leaked_file = leaked_python_filenames_.back().c_str();
+        const char* leaked_file =
+            leaked_python_filenames_.withLock([&](auto& filenames) {
+              filenames.push_back(std::make_unique<std::string>(file));
+              return filenames.back()->c_str();
+            });
 
         return std::make_unique<torch::Library>(
             parseKind(kind),
@@ -527,7 +543,7 @@ void initDispatchBindings(PyObject* module) {
 
   m.def(
       "_dispatch_clear_leaked_python_filenames",
-      []() { leaked_python_filenames_.clear(); },
+      []() { leaked_python_filenames_.withLock([](auto& f) { f.clear(); }); },
       "Clear the global storage of leaked Python filenames. "
       "WARNING: Only call this if you're sure no Library objects are still using the filenames.");
 
@@ -677,7 +693,7 @@ void initDispatchBindings(PyObject* module) {
       std::stringstream ss;
       ss << op.name;
       if (!op.overload_name.empty()) {
-        ss << "." << op.overload_name;
+        ss << '.' << op.overload_name;
       }
       names.emplace_back(std::move(ss).str());
     }
@@ -925,7 +941,7 @@ void initDispatchBindings(PyObject* module) {
       [](const char* dispatch_key) -> std::optional<c10::DispatchKey> {
         try {
           return c10::parseDispatchKey(dispatch_key);
-        } catch (const c10::Error& err) {
+        } catch (const c10::Error&) {
           return std::nullopt;
         }
       });
@@ -1045,6 +1061,13 @@ void initDispatchBindings(PyObject* module) {
   m.def("_only_lift_cpu_tensors", &torch::utils::only_lift_cpu_tensors);
   m.def("_set_only_lift_cpu_tensors", &torch::utils::set_only_lift_cpu_tensors);
 
+  m.def(
+      "_get_dtensor_allow_implicit_replication",
+      &at::get_dtensor_allow_implicit_replication);
+  m.def(
+      "_set_dtensor_allow_implicit_replication",
+      &at::set_dtensor_allow_implicit_replication);
+
   using c10::impl::TorchDispatchModeKey;
   py::enum_<TorchDispatchModeKey>(m, "_TorchDispatchModeKey")
       .value("FUNCTIONAL", TorchDispatchModeKey::FUNCTIONAL)
@@ -1063,7 +1086,8 @@ void python_op_registration_trampoline_impl(
   auto arguments = torch::jit::pop(*stack, op.schema().arguments().size());
   py::gil_scoped_acquire g;
   auto args_kwargs = parseIValuesToPyArgsKwargs(op, arguments);
-  const auto& func = python_registrations_[op.operator_name()][key];
+  auto func = python_registrations_.withLock(
+      [&](auto& regs) { return regs[op.operator_name()][key]; });
   TORCH_INTERNAL_ASSERT(func != nullptr);
   auto* pyobj = func->ptr(getPyInterpreter());
   TORCH_INTERNAL_ASSERT(pyobj != nullptr);

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 # Tests implemented in this file are relying on GitHub GraphQL APIs
 # In order to avoid test flakiness, results of the queries
 # are cached in gql_mocks.json
@@ -7,12 +8,14 @@
 # GraphQL queries in trymerge.py, please make sure to delete `gql_mocks.json`
 # And re-run the test locally with ones PAT
 
+from __future__ import annotations
+
 import gzip
 import json
 import os
 import warnings
 from hashlib import sha256
-from typing import Any, Optional
+from typing import Any
 from unittest import main, mock, skip, TestCase
 from urllib.error import HTTPError
 
@@ -32,6 +35,7 @@ from trymerge import (
     main as trymerge_main,
     MandatoryChecksMissingError,
     MergeRule,
+    PostCommentError,
     RE_GHSTACK_DESC,
     read_merge_rules,
     remove_job_name_suffix,
@@ -146,8 +150,8 @@ def mock_revert(
     pr: GitHubPR,
     *,
     dry_run: bool = False,
-    comment_id: Optional[int] = None,
-    reason: Optional[str] = None,
+    comment_id: int | None = None,
+    reason: str | None = None,
 ) -> None:
     pass
 
@@ -419,7 +423,8 @@ class TestTryMerge(TestCase):
         pr = GitHubPR("pytorch", "pytorch", 76123)
         approved_by = pr.get_approved_by()
         self.assertGreater(len(approved_by), 0)
-        assert pr._reviews is not None  # to pacify mypy
+        if pr._reviews is None:  # to pacify mypy
+            raise AssertionError("pr._reviews is None")
         self.assertGreater(len(pr._reviews), 100)
 
     def get_co_authors(self, *args: Any) -> None:
@@ -434,15 +439,13 @@ class TestTryMerge(TestCase):
         pr = GitHubPR("pytorch", "pytorch", 105260)
         conclusions = pr.get_checkrun_conclusions()
         self.assertEqual(len(conclusions), 221)
-        self.assertTrue(
-            "pull / linux-docs / build-docs-cpp-false" in conclusions.keys()
-        )
+        self.assertTrue("pull / linux-docs / build-docs-cpp-false" in conclusions)
 
     def test_cancelled_gets_ignored(self, *args: Any) -> None:
         """Tests that cancelled workflow does not override existing successful status"""
         pr = GitHubPR("pytorch", "pytorch", 110367)
         conclusions = pr.get_checkrun_conclusions()
-        lint_checks = [name for name in conclusions.keys() if "Lint" in name]
+        lint_checks = [name for name in conclusions if "Lint" in name]
         self.assertTrue(len(lint_checks) > 0)
         self.assertTrue(
             all(conclusions[name].status == "SUCCESS" for name in lint_checks)
@@ -587,6 +590,23 @@ class TestTryMerge(TestCase):
             # making another query
             self.assertEqual(mock_merge_base, pr.get_merge_base())
             mocked_gh_fetch_merge_base.assert_called_once()
+
+    def test_app_can_revert(self, *args: Any) -> None:
+        pr = GitHubPR("pytorch", "pytorch", 164660)
+        repo = DummyGitRepo()
+        app_comment_id, impostor_comment_id = 3375785595, 3377647892
+        # Check that app can revert
+        self.assertIsNotNone(validate_revert(repo, pr, comment_id=app_comment_id))
+        # But impostor can not
+        self.assertRaises(
+            PostCommentError,
+            lambda: validate_revert(repo, pr, comment_id=impostor_comment_id),
+        )
+        # Despite it's name being the name of the bot
+        self.assertEqual(
+            pr.get_comment_by_id(impostor_comment_id).author_login,
+            "pytorch-auto-revert",
+        )
 
 
 @mock.patch("trymerge.gh_graphql", side_effect=mocked_gh_graphql)

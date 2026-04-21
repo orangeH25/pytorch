@@ -64,6 +64,7 @@ class MetalKernelFunction {
   void startEncoding();
   void setArg(unsigned idx, const at::TensorBase& t);
   void setArg(unsigned idx, const void* ptr, uint64_t size);
+  void setErrorBufferIndex(unsigned idx);
   template <
       typename T,
       typename = std::enable_if_t<
@@ -116,6 +117,8 @@ class MetalShaderLibrary {
   std::vector<std::string> getFunctionNames();
   std::shared_ptr<MetalKernelFunction> getKernelFunction(
       const std::string& name);
+  // Returns a raw pointer to the kernel function for use in C APIs
+  MetalKernelFunction* getCachedKernelFunctionPtr(const std::string& name);
   inline MTLComputePipelineState_t getPipelineStateForFunc(
       const std::string& fname) {
     return getLibraryPipelineState(getLibrary(), fname).first;
@@ -138,12 +141,27 @@ class MetalShaderLibrary {
       TensorIteratorBase& iter,
       const std::string& name,
       const std::optional<c10::Scalar> alpha = std::nullopt,
-      const std::optional<c10::ScalarType> scalar_arg_type = std::nullopt);
+      const std::optional<c10::ScalarType> scalar_arg_type = std::nullopt,
+      bool supports_vec4 = false);
   void exec_binary_kernel(
       TensorIteratorBase& iter,
       const std::string& name,
       const std::optional<c10::Scalar> alpha = std::nullopt,
       const std::optional<c10::ScalarType> scalar_arg_type = std::nullopt);
+  void exec_ternary_kernel(TensorIteratorBase& iter, const std::string& name);
+
+  template <typename T>
+  void exec_unary_kernel_with_params(
+      TensorIteratorBase& iter,
+      const std::string& name,
+      T params,
+      const std::string& params_type_name);
+  template <typename T>
+  void exec_binary_kernel_with_params(
+      TensorIteratorBase& iter,
+      const std::string& name,
+      T params,
+      const std::string& params_type_name);
 
  protected:
   virtual MTLLibrary_t getLibrary();
@@ -164,6 +182,9 @@ class MetalShaderLibrary {
       std::string,
       std::pair<MTLComputePipelineState_t, MTLFunction_t>>
       cplMap;
+  // Cache for kernel functions returned by getCachedKernelFunctionPtr
+  std::unordered_map<std::string, std::unique_ptr<MetalKernelFunction>>
+      kernelCache;
 };
 
 class DynamicMetalShaderLibrary : public MetalShaderLibrary {
@@ -173,6 +194,13 @@ class DynamicMetalShaderLibrary : public MetalShaderLibrary {
     getLibrary();
   }
   ~DynamicMetalShaderLibrary() override;
+};
+
+class PrecompiledMetalShaderLibrary : public MetalShaderLibrary {
+ public:
+  explicit PrecompiledMetalShaderLibrary(std::vector<uint8_t> data);
+  explicit PrecompiledMetalShaderLibrary(const std::string& path);
+  ~PrecompiledMetalShaderLibrary() override;
 };
 
 } // namespace at::native::mps

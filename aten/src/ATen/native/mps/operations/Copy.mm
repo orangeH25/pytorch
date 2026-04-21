@@ -2,7 +2,6 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/mps/MPSProfiler.h>
 #include <ATen/native/mps/Copy.h>
-#include <ATen/native/mps/MPSGraphSonomaOps.h>
 #include <ATen/native/mps/OperationUtils.h>
 #include <ATen/ops/_copy_from_and_resize_native.h>
 #include <ATen/ops/_copy_from_native.h>
@@ -334,6 +333,7 @@ at::Tensor& mps_copy_(at::Tensor& dst, const at::Tensor& src, bool non_blocking)
 } // namespace mps
 
 Tensor _copy_from_and_resize_mps(const at::Tensor& self, const at::Tensor& dst) {
+  const_cast<Tensor&>(dst).resize_as_(self);
   return mps::mps_copy_(const_cast<Tensor&>(dst), self, false);
 }
 

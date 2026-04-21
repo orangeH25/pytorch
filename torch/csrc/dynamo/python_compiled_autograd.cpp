@@ -1,12 +1,9 @@
 #include <torch/csrc/dynamo/python_compiled_autograd.h>
 
 #include <torch/csrc/autograd/engine.h>
-#include <torch/csrc/autograd/functions/accumulate_grad.h>
 #include <torch/csrc/autograd/python_function.h>
 #include <torch/csrc/dynamo/compiled_autograd.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
-#include <torch/csrc/python_headers.h>
-#include <torch/csrc/utils/pythoncapi_compat.h>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -434,10 +431,10 @@ struct VerboseLogger : public PythonLogger {
       }
       oss << it->key_size;
       if (std::next(it) != cached_keys.end()) {
-        oss << ",";
+        oss << ',';
       }
     }
-    oss << "]";
+    oss << ']';
     std::string compile_reason = oss.str();
     log(PythonLogger::DEBUG, compile_reason);
     return compile_reason;
@@ -454,7 +451,7 @@ struct VerboseLogger : public PythonLogger {
     }
     oss << "sizes["
         << std::to_string(new_dyn_sizes_idx[new_dyn_sizes_idx.size() - 1])
-        << "]";
+        << ']';
     std::string recompile_reason = oss.str();
     log(PythonLogger::DEBUG, recompile_reason);
     return recompile_reason;
@@ -659,7 +656,7 @@ static PyObject* set_verbose_logger(PyObject* dummy, PyObject* args) {
     throw_python_error();
   }
 
-  if (logger == Py_None) {
+  if (Py_IsNone(logger)) {
     python_verbose_logger = nullptr;
   } else {
     python_verbose_logger = logger;
@@ -980,7 +977,7 @@ static CacheNode* _compiled_autograd_impl(
     // cache miss, need to capture FX graph
     TORCH_INTERNAL_ASSERT(!vlogger.has_value() || compile_reason.has_value());
     ClosingTHPObjectPtr py_compiler(
-        check(PyObject_CallNoArgs((the_autograd_compiler))));
+        check(PyObject_CallNoArgs(the_autograd_compiler)));
     PyCompilerGuard py_compiler_guard(
         std::make_unique<PyCompilerInterfaceImpl>());
 
@@ -1264,7 +1261,7 @@ static PyObject* set_autograd_compiler(PyObject* dummy, PyObject* args) {
   PyObject* prior_compiler = the_autograd_compiler;
   PyObject* prior_dynamic = default_dyn_type_int == 0 ? Py_False : Py_True;
   default_dyn_type_int = b;
-  if (obj == Py_None) { // disable
+  if (Py_IsNone(obj)) { // disable
     the_autograd_compiler = nullptr; // decref not needed due to `prior`
     Engine::set_compiled_autograd(nullptr);
   } else { // enable

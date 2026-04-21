@@ -44,7 +44,7 @@ PyObject* THPCppFunction_call(
   variable_list vars(num_inputs);
   for (int i = 0; i != num_inputs; ++i) {
     PyObject* arg = PyTuple_GET_ITEM(args, i);
-    if (arg == Py_None) {
+    if (Py_IsNone(arg)) {
       continue;
     }
     if (!THPVariable_Check(arg)) {
@@ -261,8 +261,7 @@ PyTypeObject* _initFunctionPyTypeObject(
   type.tp_traverse = THPCppFunction_traverse;
   type.tp_clear = THPCppFunction_clear;
   if (PyType_Ready(&type) < 0) {
-    auto msg = std::string("Unable to instantiate PyTypeObject for ") + name;
-    throw std::runtime_error(msg);
+    TORCH_CHECK(false, "Unable to instantiate PyTypeObject for ", name);
   }
   return &type;
 }
@@ -327,16 +326,11 @@ void registerCppFunction(const std::type_info& type, PyTypeObject* pytype) {
 }
 
 bool THPCppFunction_Check(PyObject* obj) {
-  THPObjectPtr type = THPObjectPtr(PyObject_Type(obj));
-  if ((PyTypeObject*)type.get() == get_default_type()) {
+  PyTypeObject* type = Py_TYPE(obj);
+  if (type == get_default_type()) {
     return true;
   }
-  if (cpp_function_types_set.find((PyTypeObject*)type.get()) ==
-      cpp_function_types_set.end()) {
-    return false;
-  } else {
-    return true;
-  }
+  return cpp_function_types_set.contains(type);
 }
 
 static PyObject* callRegisterFn(PyObject* dict, PyObject* hook) {
@@ -365,7 +359,7 @@ PyObject* registerFunctionHook(Node& fn, PyObject* hook) {
   if (!res) {
     return nullptr;
   }
-  if (dict == Py_None) {
+  if (Py_IsNone(dict)) {
     dict = PyTuple_GET_ITEM(res.get(), 0);
     fn.add_post_hook(std::make_unique<PyFunctionPostHook>(dict));
   }
@@ -388,7 +382,7 @@ PyObject* registerFunctionPreHook(Node& fn, PyObject* hook) {
   if (!res) {
     return nullptr;
   }
-  if (dict == Py_None) {
+  if (Py_IsNone(dict)) {
     dict = PyTuple_GET_ITEM(res.get(), 0);
     fn.add_pre_hook(std::make_unique<PyFunctionPreHook>(dict));
   }

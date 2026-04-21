@@ -2,11 +2,13 @@
 # mypy: allow-untyped-defs
 import math as pymath
 import warnings
-from typing import Any, Callable, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 
-from .triton_compat import (  # noqa: F401
+from .triton_compat import (
     _log2,
     builtins_use_semantic_kwarg,
+    JITFunction,
     libdevice,
     math,
     tl,
@@ -32,10 +34,27 @@ def set_driver_to_cpu():
     )
 
 
+def _is_backend_active(name, backend):
+    if backend.driver.is_active():
+        return True
+    # Triton may fail to detect the GPU in subprocess workers when using
+    # ctypes-based driver detection (triton-lang/triton#9578). Fall back
+    # to torch's own device checks which are more reliable in these environments.
+    if name == "nvidia":
+        import torch
+
+        return torch.cuda.is_available() and torch.version.hip is None
+    if name == "amd":
+        import torch
+
+        return torch.cuda.is_available() and torch.version.hip is not None
+    return False
+
+
 def set_driver_to_gpu():
     driver = triton.runtime.driver
     for name, backend in triton.backends.backends.items():
-        if backend.driver.is_active() and name != "cpu":
+        if _is_backend_active(name, backend) and name != "cpu":
             # After https://github.com/triton-lang/triton/commit/b844d519bc5e86edf00fe6b3c6c2d1badcd509a4,
             # `driver.active` can be of `LazyProxy` type and the sign of this - `_obj` attribute.
             if (
@@ -59,6 +78,10 @@ def get_backend_options():
     return options.__dict__
 
 
+def get_constexprs(kernel: JITFunction) -> list[int]:
+    return [p.num for p in kernel.params if p.is_constexpr]
+
+
 @triton.jit
 def promote_to_tensor(x):
     # Addition promotes to tensor for us
@@ -80,6 +103,23 @@ def remainder_integer(a, b):
     # NOTE: a % b matches C division, not floor division
     remainder = a % b
     return tl.where((remainder != 0) & ((a < 0) != (b < 0)), remainder + b, remainder)
+
+
+@triton.jit
+def pow_integer(base, exponent):
+    # Triton has no exact integer pow primitive; use repeated squaring for
+    # nonnegative integer exponents so integral scalar pow does not round
+    # through libdevice.pow before casting back to int.
+    exponent_dtype: tl.constexpr = tl.core.get_int_dtype(
+        exponent.dtype.primitive_bitwidth, signed=False
+    )
+    exp = exponent.to(exponent_dtype)
+    result = tl.full(base.shape, 1, base.dtype)
+    for _ in tl.static_range(exponent_dtype.primitive_bitwidth):
+        result = tl.where((exp & 1) != 0, result * base, result)
+        exp = exp >> 1
+        base = base * base
+    return result
 
 
 @triton.jit
@@ -176,7 +216,7 @@ def exp(x, use_fast_math: tl.constexpr):
 @triton.jit
 def online_softmax_reduce(lhs_max, lhs_sum, dim, use_fast_math: tl.constexpr):
     out_max = max2(lhs_max, dim)
-    out_max_keepdim = out_max[:, None]
+    out_max_keepdim = tl.expand_dims(out_max, dim)
     delta = tl.where(out_max_keepdim == float("-inf"), 0, lhs_max - out_max_keepdim)
     out_sum = tl.sum(lhs_sum * exp(delta, use_fast_math), dim)
     return out_max, out_sum
@@ -241,6 +281,34 @@ def welford(mean, m2, weight, dim):
 def device_assert_then(cond, msg, r):
     tl.device_assert(cond, msg)
     return r
+
+
+@triton.jit
+def rand_eager_kernel(seed, offset_blocks, tid: tl.tensor, VEC: tl.constexpr):
+    inv = 1.0 / 4294967296.0
+    half = inv * 0.5
+
+    tid_u64 = tid.to(tl.uint64)
+
+    subseq = tid_u64 // VEC
+    which4 = (tid_u64 % VEC) // 4
+    lane = tid_u64 % 4
+
+    offblk = offset_blocks.to(tl.uint64) + which4
+
+    u0, u1, u2, u3 = tl.philox(
+        seed,
+        (offblk & 0xFFFFFFFF).to(tl.uint32),
+        ((offblk >> 32) & 0xFFFFFFFF).to(tl.uint32),
+        (subseq & 0xFFFFFFFF).to(tl.uint32),
+        ((subseq >> 32) & 0xFFFFFFFF).to(tl.uint32),
+    )
+
+    v01 = tl.where(lane == 0, u0, u1)
+    v23 = tl.where(lane == 2, u2, u3)
+    rand_int = tl.where((lane == 0) | (lane == 1), v01, v23)
+
+    return 1.0 - (rand_int.to(tl.float32) * inv + half)
 
 
 @triton.jit
@@ -335,6 +403,9 @@ def bucketize_binary_search(
             is_above = values >= bucket_upper_bound
         else:
             is_above = values > bucket_upper_bound
+
+        if is_floating(values):
+            is_above = is_above | (values != values)
 
         low = tl.where(is_above & mask, mid + 1, low)
         high = tl.where(is_above, high, mid)
@@ -487,7 +558,7 @@ def exclusive_scan_decoupled_lookback_64(scratch_base, block_value, index, combi
             prefix_valid = True
 
         if flag == 2:
-            test_target = -1
+            test_target = tl.full([], -1, index.dtype)  # Match the original type
         else:
             test_target = test_target - 1
 
@@ -673,7 +744,7 @@ def select_one(x, mask, dim, keep_dims=False):
     idtype = tl.core.get_int_dtype(x.dtype.primitive_bitwidth, signed=False)
     ix = x.to(idtype, bitcast=True)
     iy = tl.sum(ix * mask, dim, keep_dims=keep_dims)
-    return iy.to(x.dtype, bitcast=True)
+    return iy.to(idtype).to(x.dtype, bitcast=True)
 
 
 @triton.jit
@@ -753,3 +824,27 @@ def if_mask(mask: Any, val, *, _builder: object = None) -> tl.constexpr:
     if isinstance(mask, tl.constexpr) and mask.value is None:
         return tl.constexpr(None)
     return val
+
+
+@triton.jit
+def inline_asm_pack(x, pack: tl.constexpr):
+    """Ravel to 1D and pad (via join with zeros) so numel is divisible by pack."""
+    result = x.ravel()
+    # Only pad when the block size is smaller than pack. When block >= pack
+    # the numel is already divisible by pack (both are powers of 2).
+    n_pad: tl.constexpr = _log2(pack) - _log2(result.numel)
+    for _ in tl.static_range(n_pad):
+        result = tl.reshape(
+            tl.join(result, tl.zeros_like(result)), (result.shape[0] * 2,)
+        )
+    return result
+
+
+@triton.jit
+def inline_asm_unpack(x, orig, pack: tl.constexpr):
+    """Unpad and reshape back to orig's shape."""
+    result = x
+    n_pad: tl.constexpr = _log2(pack) - _log2(orig.numel)
+    for _ in tl.static_range(n_pad):
+        result, _ = tl.split(tl.reshape(result, (result.shape[0] // 2, 2)))
+    return tl.reshape(result, orig.shape)
