@@ -2,6 +2,7 @@
 
 import os
 
+import torch
 import torch.distributed as dist
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -13,28 +14,28 @@ common backend API tests
 
 
 class TestMiscCollectiveUtils(TestCase):
+    expected_backend_map = {
+        "cpu": "gloo",
+        "cuda": "nccl",
+        "hpu": "hccl",
+    }
+
     def test_device_to_backend_mapping(self, device) -> None:
         """
         Test device to backend mapping
         """
-        if "cuda" in device:
-            if dist.get_default_backend_for_device(device) != "nccl":
-                raise AssertionError(
-                    f"Expected nccl, got {dist.get_default_backend_for_device(device)}"
-                )
-        elif "cpu" in device:
-            if dist.get_default_backend_for_device(device) != "gloo":
-                raise AssertionError(
-                    f"Expected gloo, got {dist.get_default_backend_for_device(device)}"
-                )
-        elif "hpu" in device:
-            if dist.get_default_backend_for_device(device) != "hccl":
-                raise AssertionError(
-                    f"Expected hccl, got {dist.get_default_backend_for_device(device)}"
-                )
-        else:
-            with self.assertRaises(ValueError):
-                dist.get_default_backend_for_device(device)
+        device_type = torch.device(device).type
+
+        if device_type in self.expected_backend_map:
+            expected = self.expected_backend_map[device_type]
+            backend = dist.get_default_backend_for_device(device)
+
+            if backend != expected:
+                raise AssertionError(f"Expected {expected}, got {backend}")
+            return
+
+        with self.assertRaises(ValueError):
+            dist.get_default_backend_for_device(device)
 
     def test_create_pg(self, device) -> None:
         """
@@ -48,14 +49,13 @@ class TestMiscCollectiveUtils(TestCase):
             backend=backend, rank=0, world_size=1, init_method="env://"
         )
         pg = dist.distributed_c10d._get_default_group()
-        backend_pg = pg._get_backend_name()
+        backend_pg = pg._get_backend(torch.device(device))._get_backend_name()
         if backend_pg != backend:
             raise AssertionError(f"Expected {backend}, got {backend_pg}")
         dist.destroy_process_group()
 
 
-devices = ["cpu", "cuda", "hpu"]
-instantiate_device_type_tests(TestMiscCollectiveUtils, globals(), only_for=devices)
+instantiate_device_type_tests(TestMiscCollectiveUtils, globals())
 
 if __name__ == "__main__":
     run_tests()
