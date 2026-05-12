@@ -42,8 +42,6 @@ from torch.testing._internal.common_quantized import (
 )
 from torch.testing._internal.common_utils import (
     make_fullrank_matrices_with_distinct_singular_values,
-    IS_ARM64,
-    IS_CPU_EXT_SVE_SUPPORTED,
     TEST_WITH_ROCM, IS_FBCODE, IS_WINDOWS, IS_MACOS, MACOS_VERSION, TEST_SCIPY,
     torch_to_numpy_dtype_dict, numpy_to_torch_dtype, TEST_WITH_ASAN,
     GRADCHECK_NONDET_TOL, slowTest, TEST_WITH_SLOW,
@@ -14572,11 +14570,7 @@ op_db: list[OpInfo] = [
                     dtypes=all_types_and(torch.bool, torch.bfloat16, torch.float16),
                     dtypesIfHpu=custom_types(torch.float32, torch.bfloat16, torch.int32),
                     always_returns_bool=True,
-                    supports_autograd=False,
-                    skips=(
-                        # MPS: The following dtypes worked in forward but are not listed by the OpInfo: {torch.complex64}.
-                        DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='mps'),
-                    )),
+                    supports_autograd=False),
     OpInfo('geqrf',
            dtypes=floating_and_complex_types(),
            sample_inputs_func=sample_inputs_linalg_qr_geqrf,
@@ -14598,11 +14592,7 @@ op_db: list[OpInfo] = [
                     dtypes=all_types_and(torch.bool, torch.bfloat16, torch.float16),
                     dtypesIfHpu=custom_types(torch.float32, torch.bfloat16, torch.int32, torch.int8),
                     always_returns_bool=True,
-                    supports_autograd=False,
-                    skips=(
-                        # MPS: The following dtypes worked in forward but are not listed by the OpInfo: {torch.complex64}.
-                        DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='mps'),
-                    )),
+                    supports_autograd=False),
     UnaryUfuncInfo('imag',
                    ref=np.imag,
                    dtypes=complex_types_and(torch.chalf),
@@ -14659,11 +14649,7 @@ op_db: list[OpInfo] = [
                     aliases=('less_equal',),
                     dtypes=all_types_and(torch.bool, torch.bfloat16, torch.float16),
                     always_returns_bool=True,
-                    supports_autograd=False,
-                    skips=(
-                        # MPS: The following dtypes worked in forward but are not listed by the OpInfo: {torch.complex64}.
-                        DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='mps'),
-                    )),
+                    supports_autograd=False),
     OpInfo('linspace',
            dtypes=all_types_and_complex_and(torch.bfloat16, torch.float16),
            dtypesIfHpu=custom_types(torch.float32, torch.bfloat16, torch.int32),
@@ -14936,11 +14922,7 @@ op_db: list[OpInfo] = [
                     dtypes=all_types_and(torch.bool, torch.bfloat16, torch.float16),
                     dtypesIfHpu=custom_types(torch.float32, torch.bfloat16, torch.int8, torch.int32),
                     always_returns_bool=True,
-                    supports_autograd=False,
-                    skips=(
-                        # MPS: The following dtypes worked in forward but are not listed by the OpInfo: {torch.complex64}.
-                        DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='mps'),
-                    )),
+                    supports_autograd=False),
     OpInfo('lu_unpack',
            op=torch.lu_unpack,
            dtypes=floating_and_complex_types(),
@@ -19269,6 +19251,12 @@ op_db: list[OpInfo] = [
                    toleranceOverride({torch.float32: tol(atol=3e-5, rtol=3e-6)}),
                    'TestConsistency', 'test_output_match', device_type='cpu',
                ),
+                DecorateInfo(
+                    toleranceOverride({torch.float32: tol(atol=5e-5, rtol=3e-6)}),
+                    'TestOperators',
+                    'test_jvp',
+                    device_type='cpu',
+                ),
                DecorateInfo(toleranceOverride({torch.float32: tol(atol=6e-5, rtol=3e-6)}),
                             'TestConsistency', 'test_output_grad_match', device_type='mps'),
            ],
@@ -19287,15 +19275,6 @@ op_db: list[OpInfo] = [
                # RuntimeError: linalg.solve.triangular(); Only float is supported!
                DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='mps'),
                DecorateInfo(unittest.expectedFailure, 'TestCommon', device_type='mps', dtypes=(torch.complex64,)),
-               # see https://github.com/pytorch/pytorch/issues/177251
-               DecorateInfo(
-                   unittest.expectedFailure,
-                   'TestOperators',
-                   'test_jvp',
-                   device_type='cpu',
-                   dtypes=[torch.float32],
-                   active_if=IS_ARM64 and IS_CPU_EXT_SVE_SUPPORTED,
-               ),
            )),
     UnaryUfuncInfo('trunc',
                    aliases=('fix', ),
