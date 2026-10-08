@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools.linter.adapters import test_linter
 from tools.linter.adapters.test_linter import (
@@ -15,6 +17,7 @@ from tools.linter.adapters.test_linter import (
     HardwareClassification,
     LintMessage,
     LintSeverity,
+    main,
     REPO_ROOT,
 )
 
@@ -28,7 +31,9 @@ def _write(path: Path, content: str) -> None:
 
 class TestHwClassificationLinter(unittest.TestCase):
     def _run(self, content: str) -> list[LintMessage]:
-        with tempfile.TemporaryDirectory() as td:
+        # The temp dir must live under test/ so the file passes _is_test_file's
+        # location check and the linter actually runs on it.
+        with tempfile.TemporaryDirectory(dir=str(REPO_ROOT / "test")) as td:
             root = Path(td)
             test_file = root / "test_sample.py"
             _write(test_file, textwrap.dedent(content))
@@ -51,12 +56,7 @@ class TestHwClassificationLinter(unittest.TestCase):
         self.assertEqual(msg.severity, LintSeverity.ERROR)
         self.assertEqual(msg.code, "TEST_LINTER")
 
-    # --- allowlist / non-test files ---
-
-    def test_non_test_file_skipped(self) -> None:
-        """Non-test files (not test_*.py or *_test.py) return no messages."""
-        msgs = check_file("some_util.py")
-        self.assertEqual(msgs, [])
+    # --- allowlist ---
 
     def test_allowlisted_file_skipped(self) -> None:
         """Files in the allowlist are skipped silently."""
@@ -65,7 +65,7 @@ class TestHwClassificationLinter(unittest.TestCase):
             class TestFoo(TestCase):
                 def test_x(self): pass
         """
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=str(REPO_ROOT / "test")) as td:
             root = Path(td)
             test_file = root / "test_sample.py"
             _write(test_file, textwrap.dedent(src))
@@ -78,148 +78,115 @@ class TestHwClassificationLinter(unittest.TestCase):
 
     # --- missing / invalid hw_classification ---
 
-    def test_missing_classification(self) -> None:
-        src = """\
-            from torch.testing._internal.common_utils import TestCase
-            class TestFoo(TestCase):
-                def test_x(self): pass
-        """
-        msgs = self._run(src)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(
-            msgs[0],
-            error_msg(
-                name="[hw_classification]",
-                path=msgs[0].path,
-                line=2,
-                description="Test class 'TestFoo' is missing or has an invalid "
-                "hw_classification. Only the exact forms below are accepted "
-                "(aliased imports are not recognized):\n"
-                "    hw_classification = HardwareClassification.<MEMBER>\n"
-                "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>",
-            ),
-        )
-
-    def test_class_under_if_guard_missing_classification(self) -> None:
-        """Conditionally defined test classes are still scanned for classification."""
-        src = """\
-            from torch.testing._internal.common_utils import TestCase
-            if True:
+    def test_missing_or_invalid_hw_classification(self) -> None:
+        """Classes without a valid hw_classification are flagged, including
+        classes nested in control flow and camelCase/async-only test classes."""
+        variants = [
+            # (source, line of the class definition)
+            (
+                """\
+                from torch.testing._internal.common_utils import TestCase
                 class TestFoo(TestCase):
                     def test_x(self): pass
-        """
-        msgs = self._run(src)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(
-            msgs[0],
-            error_msg(
-                name="[hw_classification]",
-                path=msgs[0].path,
-                line=3,
-                description="Test class 'TestFoo' is missing or has an invalid "
-                "hw_classification. Only the exact forms below are accepted "
-                "(aliased imports are not recognized):\n"
-                "    hw_classification = HardwareClassification.<MEMBER>\n"
-                "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>",
+            """,
+                2,
             ),
-        )
-
-    def test_class_under_nested_if_guard_missing_classification(self) -> None:
-        """Test classes inside nested if bodies are still scanned for classification."""
-        src = """\
-            from torch.testing._internal.common_utils import TestCase
-            if True:
+            (
+                """\
+                from torch.testing._internal.common_utils import TestCase
                 if True:
                     class TestFoo(TestCase):
                         def test_x(self): pass
-        """
-        msgs = self._run(src)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(
-            msgs[0],
-            error_msg(
-                name="[hw_classification]",
-                path=msgs[0].path,
-                line=4,
-                description="Test class 'TestFoo' is missing or has an invalid "
-                "hw_classification. Only the exact forms below are accepted "
-                "(aliased imports are not recognized):\n"
-                "    hw_classification = HardwareClassification.<MEMBER>\n"
-                "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>",
+            """,
+                3,
             ),
-        )
-
-    def test_class_under_try_guard_missing_classification(self) -> None:
-        """Test classes inside a try body are still scanned for classification."""
-        src = """\
-            from torch.testing._internal.common_utils import TestCase
-            try:
+            (
+                """\
+                from torch.testing._internal.common_utils import TestCase
+                if True:
+                    if True:
+                        class TestFoo(TestCase):
+                            def test_x(self): pass
+            """,
+                4,
+            ),
+            (
+                """\
+                from torch.testing._internal.common_utils import TestCase
+                try:
+                    class TestFoo(TestCase):
+                        def test_x(self): pass
+                except Exception:
+                    pass
+            """,
+                3,
+            ),
+            (
+                """\
+                from torch.testing._internal.common_utils import TestCase
+                try:
+                    import missing_module
+                except ImportError:
+                    class TestFoo(TestCase):
+                        def test_x(self): pass
+            """,
+                5,
+            ),
+            (
+                """\
+                from torch.testing._internal.common_utils import TestCase
                 class TestFoo(TestCase):
+                    hw_classification = "GENERIC"
                     def test_x(self): pass
-            except Exception:
-                pass
-        """
-        msgs = self._run(src)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(
-            msgs[0],
-            error_msg(
-                name="[hw_classification]",
-                path=msgs[0].path,
-                line=3,
-                description="Test class 'TestFoo' is missing or has an invalid "
-                "hw_classification. Only the exact forms below are accepted "
-                "(aliased imports are not recognized):\n"
-                "    hw_classification = HardwareClassification.<MEMBER>\n"
-                "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>",
+            """,
+                2,
             ),
-        )
-
-    def test_invalid_enum_value(self) -> None:
-        src = """\
-            from torch.testing._internal.common_utils import TestCase
-            class TestFoo(TestCase):
-                hw_classification = "GENERIC"
-                def test_x(self): pass
-        """
-        msgs = self._run(src)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(
-            msgs[0],
-            error_msg(
-                name="[hw_classification]",
-                path=msgs[0].path,
-                line=2,
-                description="Test class 'TestFoo' is missing or has an invalid "
-                "hw_classification. Only the exact forms below are accepted "
-                "(aliased imports are not recognized):\n"
-                "    hw_classification = HardwareClassification.<MEMBER>\n"
-                "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>",
+            (
+                """\
+                from torch.testing._internal.common_utils import HardwareClassification, TestCase
+                class TestFoo(TestCase):
+                    hw_classification: HardwareClassification
+                    def test_x(self): pass
+            """,
+                2,
             ),
-        )
-
-    def test_annotation_without_value(self) -> None:
-        src = """\
-            from torch.testing._internal.common_utils import HardwareClassification, TestCase
-            class TestFoo(TestCase):
-                hw_classification: HardwareClassification
-                def test_x(self): pass
-        """
-        msgs = self._run(src)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(
-            msgs[0],
-            error_msg(
-                name="[hw_classification]",
-                path=msgs[0].path,
-                line=2,
-                description="Test class 'TestFoo' is missing or has an invalid "
-                "hw_classification. Only the exact forms below are accepted "
-                "(aliased imports are not recognized):\n"
-                "    hw_classification = HardwareClassification.<MEMBER>\n"
-                "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>",
+            (
+                """\
+                from torch.testing._internal.common_utils import TestCase
+                class TestFoo(TestCase):
+                    def testBar(self): pass
+            """,
+                2,
             ),
+            (
+                """\
+                from torch.testing._internal.common_utils import TestCase
+                class TestFoo(TestCase):
+                    async def test_x(self): pass
+            """,
+                2,
+            ),
+        ]
+        description = (
+            "Test class 'TestFoo' is missing or has an invalid "
+            "hw_classification. Only the exact forms below are accepted "
+            "(aliased imports are not recognized):\n"
+            "    hw_classification = HardwareClassification.<MEMBER>\n"
+            "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>"
         )
+        for src, line in variants:
+            msgs = self._run(src)
+            self.assertEqual(len(msgs), 1, src)
+            self.assertEqual(
+                msgs[0],
+                error_msg(
+                    name="[hw_classification]",
+                    path=msgs[0].path,
+                    line=line,
+                    description=description,
+                ),
+                src,
+            )
 
     # --- non-test classes ---
 
@@ -232,32 +199,7 @@ class TestHwClassificationLinter(unittest.TestCase):
         """
         self.assertEqual(self._run(src), [])
 
-    # ==================================================================
-    # Test method shape: camelCase / async / except-handler scanning
-    # ==================================================================
-
-    def test_camel_case_only_class_missing_classification(self) -> None:
-        """A class whose tests are all camelCase (testFoo) is still a test class."""
-        src = """\
-            from torch.testing._internal.common_utils import TestCase
-            class TestFoo(TestCase):
-                def testBar(self): pass
-        """
-        msgs = self._run(src)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(
-            msgs[0],
-            error_msg(
-                name="[hw_classification]",
-                path=msgs[0].path,
-                line=2,
-                description="Test class 'TestFoo' is missing or has an invalid "
-                "hw_classification. Only the exact forms below are accepted "
-                "(aliased imports are not recognized):\n"
-                "    hw_classification = HardwareClassification.<MEMBER>\n"
-                "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>",
-            ),
-        )
+    # --- Test method shape: camelCase / async / except-handler scanning
 
     def test_mixed_snake_camel_methods_device_param_checked(self) -> None:
         """camelCase test methods in a mixed class are still checked per-method."""
@@ -281,58 +223,7 @@ class TestHwClassificationLinter(unittest.TestCase):
             ),
         )
 
-    def test_class_under_except_handler_scanned(self) -> None:
-        """Test classes inside an except handler are still scanned."""
-        src = """\
-            from torch.testing._internal.common_utils import TestCase
-            try:
-                import missing_module
-            except ImportError:
-                class TestFoo(TestCase):
-                    def test_x(self): pass
-        """
-        msgs = self._run(src)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(
-            msgs[0],
-            error_msg(
-                name="[hw_classification]",
-                path=msgs[0].path,
-                line=5,
-                description="Test class 'TestFoo' is missing or has an invalid "
-                "hw_classification. Only the exact forms below are accepted "
-                "(aliased imports are not recognized):\n"
-                "    hw_classification = HardwareClassification.<MEMBER>\n"
-                "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>",
-            ),
-        )
-
-    def test_async_test_method_classified(self) -> None:
-        """async def test_* methods make a class a test class."""
-        src = """\
-            from torch.testing._internal.common_utils import TestCase
-            class TestFoo(TestCase):
-                async def test_x(self): pass
-        """
-        msgs = self._run(src)
-        self.assertEqual(len(msgs), 1)
-        self.assertEqual(
-            msgs[0],
-            error_msg(
-                name="[hw_classification]",
-                path=msgs[0].path,
-                line=2,
-                description="Test class 'TestFoo' is missing or has an invalid "
-                "hw_classification. Only the exact forms below are accepted "
-                "(aliased imports are not recognized):\n"
-                "    hw_classification = HardwareClassification.<MEMBER>\n"
-                "    hw_classification: HardwareClassification = HardwareClassification.<MEMBER>",
-            ),
-        )
-
-    # ==================================================================
-    # GENERIC
-    # ==================================================================
+    # --- GENERIC
 
     def test_valid_generic_classification(self) -> None:
         src = """\
@@ -482,9 +373,7 @@ class TestHwClassificationLinter(unittest.TestCase):
             ),
         )
 
-    # ==================================================================
-    # ACCELERATOR
-    # ==================================================================
+    # --- ACCELERATOR
 
     def test_valid_accelerator_basic(self) -> None:
         for param in ("device", "devices"):
@@ -734,6 +623,38 @@ class TestHwClassificationLinter(unittest.TestCase):
                 "only the last call is linted.",
             ),
         )
+
+    # --- Allowlist regeneration (--regenerate)
+
+    def test_is_test_file(self) -> None:
+        """Only files matching [linter.TEST_LINTER]'s patterns are linted."""
+
+        def path_in_repo(name: str) -> str:
+            return str(REPO_ROOT / name)
+
+        for name in (
+            "test/test_foo.py",
+            "test/nested/test_foo.py",
+            "test/foo_test.py",
+        ):
+            self.assertTrue(test_linter._is_test_file(path_in_repo(name)), name)
+        for name in (
+            "test/util.py",
+            "torch/testing/test_foo.py",
+            "tools/test/test_test_linter.py",
+            "test/cpython/test_foo.py",
+            "test/cpp_extensions/open_registration_extension/test_foo.py",
+        ):
+            self.assertFalse(test_linter._is_test_file(path_in_repo(name)), name)
+
+    def test_regenerate_rejects_filenames(self) -> None:
+        """--regenerate discovers test files itself, so filenames are rejected."""
+        with mock.patch.object(
+            sys, "argv", ["test_linter.py", "--regenerate", "test/foo_test.py"]
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+        self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,14 @@ The scan covers module-level statements and statements recursively nested within
 ``if``, ``try`` (including ``except`` handlers), ``with``, ``for``, and ``while``
 bodies, so conditionally defined test classes and instantiation calls are linted
 as well.
+
+Usage:
+
+    # Lint the given files (every test file if none are given)
+    python tools/linter/adapters/test_linter.py [filenames ...]
+
+    # Regenerate the allowlist from the linter's own results
+    python tools/linter/adapters/test_linter.py --regenerate
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ from __future__ import annotations
 import argparse
 import ast
 import concurrent.futures
+import fnmatch
 import json
 import logging
 import os
@@ -83,6 +92,12 @@ class HardwareClassification(Enum):
 # Files in this allowlist are temporarily excluded from test linter checks
 ALLOWLIST_PATH = Path(__file__).resolve().parent / "test_linter_allowlist.json"
 ALLOWLIST_REL_PATH = os.path.relpath(ALLOWLIST_PATH, REPO_ROOT)
+
+INCLUDE_PATTERNS = ("test/**/test_*.py", "test/**/*_test.py")
+EXCLUDE_PREFIXES = (
+    "test/cpp_extensions/open_registration_extension/",
+    "test/cpython/",
+)
 
 
 def _load_allowlist() -> set[str]:
@@ -126,10 +141,28 @@ error_msg = partial(
 
 
 def _is_test_file(filename: str) -> bool:
-    name = os.path.basename(filename)
-    if not name.endswith(".py"):
+    """True for test files this linter applies to."""
+    if not os.path.basename(filename).endswith(".py"):
         return False
-    return name.startswith("test_") or name.endswith("_test.py")
+
+    rel_path = os.path.relpath(filename, REPO_ROOT).replace("\\", "/")
+    if rel_path.startswith(EXCLUDE_PREFIXES):
+        return False
+
+    return any(
+        fnmatch.fnmatchcase(rel_path, pattern.replace("**/", "*"))
+        for pattern in INCLUDE_PATTERNS
+    )
+
+
+def _discover_files() -> list[Path]:
+    """Return the test files this linter applies to, sorted."""
+    files: set[Path] = set()
+    for pattern in INCLUDE_PATTERNS:
+        for path in REPO_ROOT.glob(pattern):
+            if _is_test_file(str(path)):
+                files.add(path)
+    return sorted(files)
 
 
 def _is_test_class(node: ast.ClassDef) -> bool:
@@ -279,11 +312,11 @@ def _collect_test_classes(
     """
     class_defs: dict[str, ast.ClassDef] = {}
     instantiations: dict[str, ast.Call] = {}
-    duplicate_messages: list[LintMessage] = []
+    messages: list[LintMessage] = []
     for stmt in _scanned_statements(tree):
         if isinstance(stmt, ast.ClassDef) and _is_test_class(stmt):
             if stmt.name in class_defs:
-                duplicate_messages.append(
+                messages.append(
                     error_msg(
                         name="[duplicate_class]",
                         path=filename,
@@ -301,7 +334,7 @@ def _collect_test_classes(
                 and isinstance(call.args[0], ast.Name)
             ):
                 if call.args[0].id in instantiations:
-                    duplicate_messages.append(
+                    messages.append(
                         error_msg(
                             name="[duplicate_instantiation]",
                             path=filename,
@@ -317,7 +350,7 @@ def _collect_test_classes(
             name: ClassEntry(class_defs[name], instantiations.get(name))
             for name in class_defs
         },
-        duplicate_messages,
+        messages,
     )
 
 
@@ -640,12 +673,8 @@ def _check_no_only_for(ctx: RuleContext) -> list[LintMessage]:
 
 
 def check_file(filename: str) -> list[LintMessage]:
-    if not _is_test_file(filename):
-        return []
-
+    # Callers pre-filter with _is_test_file; only the allowlist gate remains.
     rel_path = os.path.relpath(filename, REPO_ROOT).replace("\\", "/")
-
-    # Skip checks for files in the allowlist
     if rel_path in _allowlist:
         return []
 
@@ -663,9 +692,9 @@ def check_file(filename: str) -> list[LintMessage]:
             )
         ]
 
-    test_classes, duplicate_messages = _collect_test_classes(tree, filename)
+    test_classes, messages = _collect_test_classes(tree, filename)
 
-    messages: list[LintMessage] = list(duplicate_messages)
+    messages: list[LintMessage] = list(messages)
     for entry in test_classes.values():
         node = entry.class_def
         classification = _get_hw_classification(node)
@@ -697,6 +726,45 @@ def check_file(filename: str) -> list[LintMessage]:
     return messages
 
 
+def _regenerate_allowlist() -> None:
+    """Regenerate the allowlist from the linter's results on all test files."""
+    # check_file() returns nothing for files already in the allowlist, which
+    # would drop every existing entry; clear it so the list is rebuilt from the
+    # linter's real output rather than from its current contents.
+    global _allowlist
+    _allowlist = set()
+
+    files = _discover_files()
+    entries = [
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in files
+        if check_file(str(path))
+    ]
+
+    old_content = (
+        ALLOWLIST_PATH.read_text(encoding="utf-8") if ALLOWLIST_PATH.exists() else ""
+    )
+    old: list[str] = json.loads(old_content) if old_content else []
+
+    added = sorted(set(entries) - set(old))
+    removed = sorted(set(old) - set(entries))
+
+    print(f"Checked {len(files)} test files; {len(entries)} require allowlisting.")
+    print(f"Allowlist changes: {len(added)} added, {len(removed)} removed.")
+
+    color = sys.stdout.isatty()
+    for prefix, paths in (("+", added), ("-", removed)):
+        for path in paths:
+            if color:
+                code = "\033[32m" if prefix == "+" else "\033[31m"
+                print(f"  {code}{prefix} {path}\033[0m")
+            else:
+                print(f"  {prefix} {path}")
+
+    ALLOWLIST_PATH.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+    print(f"wrote {len(entries)} entries to {ALLOWLIST_REL_PATH}")
+
+
 def _default_num_workers() -> int | None:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs and max_jobs.isdigit() and int(max_jobs) > 0:
@@ -714,8 +782,21 @@ def main() -> None:
         action="store_true",
         help="verbose logging",
     )
-    parser.add_argument("filenames", nargs="+", help="paths to lint")
+    parser.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="regenerate the allowlist from actual linter results",
+    )
+    parser.add_argument(
+        "filenames", nargs="*", help="paths to lint (all test files if omitted)"
+    )
     args = parser.parse_args()
+
+    if args.regenerate:
+        if args.filenames:
+            parser.error("filenames cannot be combined with --regenerate")
+        _regenerate_allowlist()
+        return
 
     logging.basicConfig(
         format="<%(threadName)s:%(levelname)s> %(message)s",
@@ -723,11 +804,15 @@ def main() -> None:
         stream=sys.stderr,
     )
 
+    # No filenames means lint every test file this linter applies to.
+    candidates = args.filenames or [str(p) for p in _discover_files()]
+    filenames = [x for x in candidates if _is_test_file(x)]
+
     found_errors = False
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=_default_num_workers(),
     ) as executor:
-        futures = {executor.submit(check_file, x): x for x in args.filenames}
+        futures = {executor.submit(check_file, x): x for x in filenames}
         for future in concurrent.futures.as_completed(futures):
             try:
                 for lint_message in future.result():
